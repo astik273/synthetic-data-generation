@@ -13,13 +13,12 @@ from langfuse.decorators import observe, langfuse_context
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
+load_dotenv(dotenv_path=os.environ["ENV_PATH"])
+anthropic_client = Anthropic()
+
 EMB_DIM = 1536
 MAX_WORKERS = 16
 TARGET_DIR = os.environ["TARGET_DIR"]
-
-load_dotenv(dotenv_path=os.environ["ENV_PATH"])
-
-anthropic_client = Anthropic()
 
 
 def truncate_text(text, model, max_tokens):
@@ -328,19 +327,39 @@ def retrieve_top_docs(query_vector, df, emb_cols, top_n=10):
     top_docs = df.sort_values(by="similarity", ascending=False).head(top_n)
     return top_docs
 
-def query_llm(model, documents, query):
+def query_llm(model, documents, query, chat_history=None):
+    """
+    Query the language model with documents and query, including chat history for context.
+    
+    Args:
+        model: The model to use for querying
+        documents: The documents to include for context
+        query: The current user query
+        chat_history: Optional list of previous message exchanges
+    
+    Returns:
+        The model's response
+    """
     combined_content = "\n".join([f"File: {doc['file_path']}\nContent: {doc['content']}" for doc in documents])
+    
+    # Initialize with system message
     messages = [
-        {"role": "system", "content": "You are a Coding Assistant."},
-        {"role": "user", "content": f"Here is the combined content of the documents: {combined_content}\n\nBased on that answer the below query.\n\nQuery: {query}"}
+        {"role": "system", "content": "You are a Coding Assistant that helps with code-related questions using the provided repository content."}
     ]
+    
+    # Add chat history if available
+    if chat_history and len(chat_history) > 0:
+        messages.extend(chat_history)
+    
+    # Add current query with content context
+    messages.append({"role": "user", "content": f"Here is the content from the repository:\n\n{combined_content}\n\nBased on that, please answer my query: {query}"})
 
     if model.startswith("gpt"):
         response = call_models(
             messages=messages,
             provider="openai",
             model="gpt-4o",
-            max_tokens=16384,
+            max_tokens=16_000,
             temperature=0.2,
             stream=True,
         )
@@ -349,7 +368,7 @@ def query_llm(model, documents, query):
             messages=messages,
             provider="anthropic",
             model="claude-3-5-sonnet-20241022",
-            max_tokens=16384,
+            max_tokens=8_000,
             temperature=0.2,
             stream=True,
         )
@@ -357,78 +376,198 @@ def query_llm(model, documents, query):
     return response
 
 
+# Initialize session state for chat history if it doesn't exist
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
 # Centered title using markdown and HTML
 st.markdown("<h1 style='text-align: center;'>Coding Assistant</h1>", unsafe_allow_html=True)
 
 # Dummy options for models and repositories
 models = ["gpt-4o", "claude-3-5-sonnet-20241022"]
-repositories = [
+
+# Store the full repository URLs
+repo_urls = [
     "https://github.com/sourcegraph/sourcegraph-public-snapshot",
     "https://github.com/huggingface/transformers",
     "https://github.com/pytorch/pytorch",
     "https://github.com/keras-team/keras-nlp",
 ]
 
-# UI elements
-selected_model = st.selectbox("Select Model:", models)
-selected_repo = st.selectbox("Select Repository:", repositories)
-query = st.text_area("Enter your query:", height=150)
+# Create display names in org/repo format
+repo_display_names = [url.removeprefix("https://github.com/") for url in repo_urls]
 
-# Center the button using CSS
-st.markdown(
-    """
-    <style>
-    div.stButton > button {
-        display: block;
-        margin: 0 auto;
-        padding: 0.5rem 2rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+# Add "No Context" option (will be handled specially)
+repo_display_names = ["No Context"] + repo_display_names
 
-if st.button("Send"):
-    if not selected_repo or not query:
-        st.warning("Please enter a query and select a repository.")
-    else:
-        st.info(f"Starting to process your query over the selected repository...")
+# Create a mapping from display names to full URLs (excluding "No Context")
+repo_mapping = dict(zip(repo_display_names[1:], repo_urls))
+
+# Sidebar for model and repository selection
+with st.sidebar:
+    st.header("Settings")
+    selected_model = st.selectbox("Select Model:", models)
+    selected_repo_display = st.selectbox("Select Repository:", repo_display_names)
+    
+    # Show top-k slider only if not using "No Context" mode
+    if selected_repo_display != "No Context":
+        # Get the full URL for the selected repo display name
+        selected_repo = repo_mapping[selected_repo_display]
         
-        repo_dir = os.path.join(TARGET_DIR, "repos/", selected_repo.removeprefix("https://github.com/").removesuffix(".git").replace("/", "_"))
-        index_dir = os.path.join(TARGET_DIR, "indices/", selected_repo.removeprefix("https://github.com/").removesuffix(".git").replace("/", "_"))
+        # Add slider for top-k documents
+        if "top_k" not in st.session_state:
+            st.session_state.top_k = 10  # Default value
+        
+        top_k = st.slider(
+            "Number of documents to retrieve:",
+            min_value=1,
+            max_value=20,
+            value=st.session_state.top_k,
+            step=1
+        )
+        st.session_state.top_k = top_k
+    
+    # Add a button to clear chat history
+    if st.button("Clear Chat History"):
+        st.session_state.chat_history = []
+        st.session_state.messages = []
 
-        if not os.path.exists(repo_dir):
-            try:
-                repo_dir = clone_repository(selected_repo, repo_dir)
-                st.write("Repository cloned successfully!")
-            except Exception as e:
-                st.error("Error cloning repository: " + str(e))
-                st.stop()
-        else:
-            if not os.path.exists(index_dir):
-                try:
+# Display chat messages
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
+
+# Chat input
+query = st.chat_input("Ask a question about the repository...")
+
+if query:
+    # Add user message to chat
+    st.session_state.messages.append({"role": "user", "content": query})
+    
+    # Display user message
+    with st.chat_message("user"):
+        st.write(query)
+    
+    # Display assistant thinking indicator
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        message_placeholder.markdown("Thinking...")
+        
+        try:
+            # No Context mode - skip repository processing
+            if selected_repo_display == "No Context":
+                # Extract chat history for the LLM
+                chat_history = []
+                for msg in st.session_state.chat_history:
+                    chat_history.append({"role": msg["role"], "content": msg["content"]})
+                
+                # Create messages for the model
+                messages = [
+                    {"role": "system", "content": "You are a helpful coding assistant."}
+                ]
+                
+                # Add chat history if available
+                if chat_history and len(chat_history) > 0:
+                    messages.extend(chat_history)
+                
+                # Add current query
+                messages.append({"role": "user", "content": query})
+                
+                # Call the model directly
+                if selected_model.startswith("gpt"):
+                    answer = call_models(
+                        messages=messages,
+                        provider="openai",
+                        model="gpt-4o",
+                        max_tokens=16000,
+                        temperature=0.2,
+                        stream=True,
+                    )
+                elif selected_model.startswith("claude"):
+                    answer = call_models(
+                        messages=messages,
+                        provider="anthropic",
+                        model="claude-3-5-sonnet-20241022",
+                        max_tokens=8000,
+                        temperature=0.2,
+                        stream=True,
+                    )
+                
+                # Update the placeholder with the response
+                message_placeholder.markdown(answer)
+                
+                # Add the assistant's response to chat history
+                st.session_state.messages.append({"role": "assistant", "content": answer})
+                
+                # Update the conversation history for next query
+                st.session_state.chat_history.append({"role": "user", "content": query})
+                st.session_state.chat_history.append({"role": "assistant", "content": answer})
+            
+            # Repository context mode - existing code
+            else:
+                # Process the repository
+                repo_dir = os.path.join(TARGET_DIR, "repos/", selected_repo.removeprefix("https://github.com/").removesuffix(".git").replace("/", "_"))
+                index_dir = os.path.join(TARGET_DIR, "indices/", selected_repo.removeprefix("https://github.com/").removesuffix(".git").replace("/", "_"))
+
+                # Clone repository if it doesn't exist
+                if not os.path.exists(repo_dir):
+                    repo_dir = clone_repository(selected_repo, repo_dir)
+                
+                # Build index if it doesn't exist
+                if not os.path.exists(index_dir):
                     df_index = build_index(repo_dir, index_dir)
-                    st.write(f"Index built and stored at {index_dir}")
-                except Exception as e:
-                    st.error("Error building index: " + str(e))
-                    st.stop()
-        
-        if os.path.exists(index_dir):
-            # load it
-            df_index = pd.read_csv(os.path.join(index_dir, "repo.csv"))
-            query_vector = get_query_embedding(query)
-            emb_cols = [f"emb_{i}" for i in range(EMB_DIM)]
-            top_docs = retrieve_top_docs(query_vector, df_index, emb_cols, top_n=10)
+                else:
+                    df_index = pd.read_csv(os.path.join(index_dir, "repo.csv"))
+                
+                # Get embeddings and retrieve relevant documents
+                query_vector = get_query_embedding(query)
+                emb_cols = [f"emb_{i}" for i in range(EMB_DIM)]
+                top_docs = retrieve_top_docs(query_vector, df_index, emb_cols, top_n=st.session_state.top_k)
+                
+                # Display top retrieved documents
+                docs_info = top_docs[["file_path", "similarity"]].copy()
+                # Clean up file paths to be more readable
+                docs_info["file_path"] = docs_info["file_path"].apply(
+                    lambda path: path.replace(repo_dir, "").lstrip("/")
+                )
+                # Format similarity scores to be more readable
+                docs_info["similarity"] = docs_info["similarity"].apply(
+                    lambda score: f"{score:.4f}"
+                )
+                
+                # Create a markdown table of the top documents
+                docs_markdown = "**Top Retrieved Documents:**\n\n"
+                docs_markdown += "| # | File | Similarity |\n"
+                docs_markdown += "|---|------|------------|\n"
+                
+                for i, (_, row) in enumerate(docs_info.iterrows(), 1):
+                    docs_markdown += f"| {i} | `{row['file_path']}` | {row['similarity']} |\n"
+                
+                # Convert user query and top documents to format for LLM
+                doc_contents = top_docs[["file_path", "content"]].to_dict(orient="records")
+                
+                # Extract chat history for the LLM in the right format
+                chat_history = []
+                for msg in st.session_state.chat_history:
+                    chat_history.append({"role": msg["role"], "content": msg["content"]})
+                
+                # Query the LLM with chat history
+                answer = query_llm(selected_model, doc_contents, query, chat_history)
+                
+                # Update the placeholder with the documents and response
+                full_response = f"{docs_markdown}\n\n---\n\n{answer}"
+                message_placeholder.markdown(full_response)
+                
+                # Add the assistant's response to chat history
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+                
+                # Update the conversation history for next query (without the document list)
+                st.session_state.chat_history.append({"role": "user", "content": query})
+                st.session_state.chat_history.append({"role": "assistant", "content": answer})
             
-            st.subheader("Top Retrieved Documents:")
-            st.write(top_docs[["file_path", "similarity"]])
-            
-            # Gather contents from the top documents
-            doc_contents = top_docs[["file_path", "content"]].to_dict(orient="records")
-            
-            # Query the LLM using the combined document content and query
-            answer = query_llm(selected_model, doc_contents, query)
-            
-            st.subheader("Final Response:")
-            st.write(answer)
+        except Exception as e:
+            message_placeholder.error(f"Error processing your query: {str(e)}")
 
